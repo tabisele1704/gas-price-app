@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ガソリン請求金額 計算</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; box-shadow: 0 2px 6px rgba(0,0,0,.06); }
+    label { display:block; margin: 12px 0 4px; font-weight: 600; }
+    input[type="number"] { width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #ccc; }
+    button { margin-top: 12px; padding: 12px 16px; font-size: 16px; border: 0; border-radius: 8px; cursor: pointer; }
+    .primary { background: #2563eb; color:#fff; }
+    .muted { color:#666; font-size: 13px; }
+    .row { display:flex; gap:12px; align-items: center; flex-wrap: wrap; }
+    .kpi { font-size: 22px; font-weight: 700; }
+    .kpi small { font-size: 12px; font-weight: 600; color:#666; }
+    .error { color:#b00020; margin-top:8px; }
+    .ok { color:#065f46; }
+  </style>
+</head>
+<body>
+  <h1>ガソリン請求金額 計算</h1>
+  <div class="card">
+    <p class="muted">参照：<a href="https://gogo.gs/ranking/average/" target="_blank" rel="noopener">gogo.gs（レギュラー平均）</a></p>
+
+    <div class="row" style="justify-content: space-between;">
+      <div>
+        <div class="kpi" id="priceKpi">--.- <small>円/L</small></div>
+        <div class="muted" id="updatedKpi">更新日: ―</div>
+      </div>
+      <button class="primary" id="reloadBtn">最新価格を取得</button>
+    </div>
+
+    <label for="literInput">給油量でｰす （L）</label>
+    <input id="literInput" type="number" inputmode="decimal" step="0.1" placeholder="例）35" />
+
+    <div class="row">
+      <button class="primary" id="calcBtn">請求金額を計算</button>
+      <button id="clearBtn">クリア</button>
+    </div>
+
+    <div id="result" style="margin-top: 12px;"></div>
+    <div id="err" class="error"></div>
+  </div>
+
+  <script>
+    let currentPrice = null;
+
+    async function loadPrice() {
+      const err = document.getElementById("err");
+      err.textContent = "";
+      try {
+        const r = await fetch("/api/price", { cache: "no-store" });
+        if (!r.ok) throw new Error("価格取得に失敗しました");
+        const data = await r.json();
+        const p = data?.regular?.price_yen_per_liter;
+        const u = data?.regular?.updated || "不明";
+        if (typeof p !== "number") throw new Error("価格データが不正です");
+        currentPrice = p;
+        document.getElementById("priceKpi").innerHTML = `${p.toFixed(1)} <small>円/L</small>`;
+        document.getElementById("updatedKpi").textContent = `更新日: ${u}`;
+      } catch (e) {
+        err.textContent = e.message + "（ページ構造変更等の可能性）";
+      }
+    }
+
+    function calc() {
+      const result = document.getElementById("result");
+      const err = document.getElementById("err");
+      err.textContent = "";
+      result.innerHTML = "";
+
+      const liter = parseFloat(document.getElementById("literInput").value);
+      if (!currentPrice) { err.textContent = "『最新価格を取得』を押してください。"; return; }
+      if (isNaN(liter) || liter <= 0) { err.textContent = "給油量（L）を正しく入力してください。"; return; }
+
+      const total = currentPrice * liter;
+      result.innerHTML = `
+        <div class="ok">
+          単価：${currentPrice.toFixed(1)} 円/L × 給油量：${liter.toFixed(1)} L
+          <br><strong>請求金額：${Math.round(total).toLocaleString()} 円</strong>
+          <div class="muted">（gogo.gsの平均価格は税込相当として扱います）</div>
+        </div>`;
+    }
+
+    document.getElementById("reloadBtn").addEventListener("click", loadPrice);
+    document.getElementById("calcBtn").addEventListener("click", calc);
+    document.getElementById("clearBtn").addEventListener("click", () => {
+      document.getElementById("literInput").value = "";
+      document.getElementById("result").innerHTML = "";
+      document.getElementById("err").textContent = "";
+    });
+
+    // 初回自動取得
+    loadPrice();
+  </script>
+</body>
+</html>
