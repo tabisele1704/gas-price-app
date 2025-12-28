@@ -1,6 +1,8 @@
-﻿from flask import Flask, render_template, request
+﻿from flask import Flask, render_template, request, Response
 import re
 import requests
+from functools import wraps
+import os
 
 app = Flask(__name__)
 
@@ -13,34 +15,49 @@ FUEL_LABELS = {
     "diesel": "軽油",
 }
 
-# 現実的な価格レンジ（誤爆防止）
 RANGE = {
     "regular": (80.0, 300.0),
     "highoctane": (80.0, 350.0),
     "diesel": (60.0, 300.0),
 }
 
+def require_basic_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # ローカル開発中はバイパスできる（RenderではOFFにする）
+        if os.environ.get("DEV_BYPASS_AUTH") == "1":
+            return f(*args, **kwargs)
+
+        user = os.environ.get("BASIC_USER", "")
+        pw = os.environ.get("BASIC_PASS", "")
+        # 未設定なら安全側で拒否
+        if not user or not pw:
+            return Response(
+                "Auth not configured", 401,
+                {"WWW-Authenticate": 'Basic realm="Login Required"'}
+            )
+
+        auth = request.authorization
+        if not auth or auth.username != user or auth.password != pw:
+            return Response(
+                "Authentication required", 401,
+                {"WWW-Authenticate": 'Basic realm="Login Required"'}
+            )
+        return f(*args, **kwargs)
+    return decorated
+
 
 def _nearby_candidates(html: str, label: str, key: str) -> list[float]:
-    """
-    label（例：レギュラー）の近傍から、小数1桁の数値候補を複数拾う。
-    ※「円」という文字に依存しない（タグ分割に強い）
-    """
     lo, hi = RANGE[key]
-
-    # gogo.gs の価格表記は「xxx.x」が多いので小数1桁を狙う（誤爆が減る）
     num_pat = r"(\d{2,3}\.\d)"
-
     candidates: list[float] = []
 
-    # 1) label直後の短い範囲（強い）
     m = re.findall(label + r"[\s\S]{0,450}?" + num_pat, html)
     for x in m:
         p = float(x)
         if lo <= p <= hi:
             candidates.append(p)
 
-    # 2) <tr>行内（表なら強い）
     rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
     for row in rows:
         if label in row:
@@ -50,7 +67,6 @@ def _nearby_candidates(html: str, label: str, key: str) -> list[float]:
                 if lo <= p <= hi:
                     candidates.append(p)
 
-    # 3) label周辺の広めウィンドウ（保険）
     idx = html.find(label)
     if idx != -1:
         window = html[max(0, idx - 800): idx + 3500]
@@ -60,7 +76,6 @@ def _nearby_candidates(html: str, label: str, key: str) -> list[float]:
             if lo <= p <= hi:
                 candidates.append(p)
 
-    # 重複除去（順序維持）
     seen = set()
     uniq = []
     for p in candidates:
@@ -88,40 +103,24 @@ def fetch_prices_from_url() -> dict:
 
     cand = {k: _nearby_candidates(html, label, k) for k, label in FUEL_LABELS.items()}
 
-    # まず、合っていることが多い “先頭候補” を採用
     high = cand["highoctane"][0] if cand["highoctane"] else None
     diesel = cand["diesel"][0] if cand["diesel"] else None
 
-    # レギュラーは誤爆しやすいので整合性で選ぶ
     reg = None
     reg_cand = cand["regular"]
-
     if reg_cand:
         if high is not None and diesel is not None:
-            # 軽油 < レギュラー < ハイオク の間に入る候補を優先
             between = [p for p in reg_cand if diesel < p < high]
-            if between:
-                # between の中で「最小」を採用（誤爆で高すぎる値を避けやすい）
-                reg = min(between)
-            else:
-                # 間に入らないなら「最小」を採用（202みたいな異常高値より低いほうを選ぶ）
-                reg = min(reg_cand)
+            reg = min(between) if between else min(reg_cand)
         else:
             reg = min(reg_cand)
 
     prices = {"regular": reg, "highoctane": high, "diesel": diesel}
-
-    # もし取得できなかった燃料があるなら、原因調査用に候補をログへ
-    if any(v is None for v in prices.values()):
-        print("PRICE_FETCH_FAILED")
-        print("STATUS:", r.status_code, "CONTENT_TYPE:", r.headers.get("Content-Type"))
-        print("CANDIDATES:", cand)
-        print("HEAD_400:\n", html[:400])
-
     return prices
 
 
 @app.route("/", methods=["GET", "POST"])
+@require_basic_auth
 def index():
     error = None
     try:
