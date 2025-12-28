@@ -1,241 +1,167 @@
-﻿# -*- coding: utf-8 -*-
-"""
-server.py
-
-ガソリンの給油量から、参照単価を使って請求金額を計算する
-シンプルなWebアプリのサーバー部分です。
-
-✔ Python（Flask）で動作
-✔ HTMLテンプレート（templates/index.html）と連携
-✔ gogo.gs の「全国のガソリン平均価格」→「レギュラー」を取得して計算
-✔ 後でクラウド（Render等）に置けるように PORT 環境変数にも対応
-"""
-
-from flask import Flask, render_template, request, jsonify
-import os
-
-# ★ 追加：gogo.gs から単価を取得するためのライブラリ
-import requests
-from bs4 import BeautifulSoup
+﻿from flask import Flask, render_template, request
 import re
+import requests
 
-# Flask アプリ本体を作成
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__)
 
-# ★ 変更：単価を掲載しているサイトのURL
-REFERENCE_URL = "https://gogo.gs/ranking/average/"
+# 参照URL（ここだけを参照）
+URL = "https://gogo.gs/ranking/average/"
+
+FUEL_LABELS = {
+    "regular": "レギュラー",
+    "highoctane": "ハイオク",
+    "diesel": "軽油",
+}
+
+# 現実的な価格レンジ（誤爆防止）
+RANGE = {
+    "regular": (80.0, 300.0),
+    "highoctane": (80.0, 350.0),
+    "diesel": (60.0, 300.0),
+}
 
 
-def get_unit_price():
+def _nearby_candidates(html: str, label: str, key: str) -> list[float]:
     """
-    ガソリン1Lあたりの単価（円）を取得する関数。
-
-    gogo.gs の「都道府県平均 ガソリン価格ランキング - レギュラー」
-    ページから「全国のガソリン平均価格」→「レギュラー」の価格を
-    スクレイピングして取得します。
-
-    戻り値:
-        float: レギュラーの単価（例: 162.2）
-
-    取得できない場合は RuntimeError を投げます。
+    label（例：レギュラー）の近傍から、小数1桁の数値候補を複数拾う。
+    ※「円」という文字に依存しない（タグ分割に強い）
     """
+    lo, hi = RANGE[key]
 
+    # gogo.gs の価格表記は「xxx.x」が多いので小数1桁を狙う（誤爆が減る）
+    num_pat = r"(\d{2,3}\.\d)"
+
+    candidates: list[float] = []
+
+    # 1) label直後の短い範囲（強い）
+    m = re.findall(label + r"[\s\S]{0,450}?" + num_pat, html)
+    for x in m:
+        p = float(x)
+        if lo <= p <= hi:
+            candidates.append(p)
+
+    # 2) <tr>行内（表なら強い）
+    rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
+    for row in rows:
+        if label in row:
+            m2 = re.findall(num_pat, row)
+            for x in m2:
+                p = float(x)
+                if lo <= p <= hi:
+                    candidates.append(p)
+
+    # 3) label周辺の広めウィンドウ（保険）
+    idx = html.find(label)
+    if idx != -1:
+        window = html[max(0, idx - 800): idx + 3500]
+        m3 = re.findall(num_pat, window)
+        for x in m3:
+            p = float(x)
+            if lo <= p <= hi:
+                candidates.append(p)
+
+    # 重複除去（順序維持）
+    seen = set()
+    uniq = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def fetch_prices_from_url() -> dict:
     headers = {
-        # ブラウザっぽい User-Agent を付けておく
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
     }
 
-    # gogo.gs にアクセス
-    res = requests.get(REFERENCE_URL, headers=headers, timeout=10)
-    res.raise_for_status()  # 200 以外ならここで例外
+    r = requests.get(URL, headers=headers, timeout=20)
+    r.raise_for_status()
+    html = r.text
 
-    # HTML を解析
-    soup = BeautifulSoup(res.text, "html.parser")
+    cand = {k: _nearby_candidates(html, label, k) for k, label in FUEL_LABELS.items()}
 
-    # ページ全体のテキストを 1 行の文字列にまとめる
-    # 例: "… 全国のガソリン平均価格 レギュラー 162.2 - 2.5 ハイオク 173.5 …"
-    text = soup.get_text(" ", strip=True)
+    # まず、合っていることが多い “先頭候補” を採用
+    high = cand["highoctane"][0] if cand["highoctane"] else None
+    diesel = cand["diesel"][0] if cand["diesel"] else None
 
-    # 「全国のガソリン平均価格 レギュラー 162.2 …」の 162.2 を抜き出す
-    m = re.search(r"全国のガソリン平均価格\s*レギュラー\s*([\d.,]+)", text)
+    # レギュラーは誤爆しやすいので整合性で選ぶ
+    reg = None
+    reg_cand = cand["regular"]
 
-    if not m:
-        # レイアウト変更などで見つからなかった場合
-        raise RuntimeError("レギュラー価格が見つかりませんでした。サイト構成が変わった可能性があります。")
+    if reg_cand:
+        if high is not None and diesel is not None:
+            # 軽油 < レギュラー < ハイオク の間に入る候補を優先
+            between = [p for p in reg_cand if diesel < p < high]
+            if between:
+                # between の中で「最小」を採用（誤爆で高すぎる値を避けやすい）
+                reg = min(between)
+            else:
+                # 間に入らないなら「最小」を採用（202みたいな異常高値より低いほうを選ぶ）
+                reg = min(reg_cand)
+        else:
+            reg = min(reg_cand)
 
-    price_str = m.group(1).replace(",", "")  # "162.2" → "162.2" / "1,234.5" → "1234.5"
-    unit_price = float(price_str)
+    prices = {"regular": reg, "highoctane": high, "diesel": diesel}
 
-    return unit_price # 円/リットル
+    # もし取得できなかった燃料があるなら、原因調査用に候補をログへ
+    if any(v is None for v in prices.values()):
+        print("PRICE_FETCH_FAILED")
+        print("STATUS:", r.status_code, "CONTENT_TYPE:", r.headers.get("Content-Type"))
+        print("CANDIDATES:", cand)
+        print("HEAD_400:\n", html[:400])
+
+    return prices
 
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "POST"])
 def index():
-    """
-    トップページ表示用（フォーム画面）。
-
-    templates/index.html を表示します。
-    単価だけ渡して、金額はまだ計算しない状態。
-    """
+    error = None
     try:
-        unit_price = get_unit_price()
-        error_message = None
+        prices = fetch_prices_from_url()
     except Exception as e:
-        # 単価取得に失敗した場合でも画面自体は表示したい
-        unit_price = None
-        error_message = f"ガソリン価格の取得に失敗しました：{e}"
+        prices = {k: None for k in FUEL_LABELS.keys()}
+        error = f"単価取得エラー: {e}"
+
+    fuel_key = request.form.get("fuel", "regular") if request.method == "POST" else "regular"
+    fuel_label = FUEL_LABELS.get(fuel_key, "レギュラー")
+    unit_price = prices.get(fuel_key)
+
+    liters = None
+    total = None
+    formatted_total = None
+
+    if request.method == "POST":
+        try:
+            liters = float(request.form.get("liters", "").strip())
+            if unit_price is None:
+                error = (error + " / " if error else "") + f"{fuel_label}の単価を取得できませんでした"
+            else:
+                total = round(liters * unit_price, 2)
+                formatted_total = f"{total:,.0f}"
+        except Exception:
+            error = "給油量（L）の入力が正しくありません"
 
     return render_template(
         "index.html",
-        unit_price=unit_price,   # 画面に表示する単価
-        total_price=None,        # まだ計算前なので None
-        liters=None,             # 入力値もまだなし
-        error_message=error_message,
-    )
-
-
-@app.route("/calculate", methods=["POST"])
-def calculate():
-    """
-    フォームから送信された給油量を使って請求金額を計算するルート。
-
-    ・給油量（liters）を受け取る
-    ・単価を取得（get_unit_price）
-    ・金額 = 単価 × 給油量 を計算
-    ・結果を index.html に渡して再表示
-    """
-    try:
-        # フォームから文字列として取得
-        liters_str = request.form.get("liters", "").strip()
-
-        if liters_str == "":
-            # 空欄だった場合
-            raise ValueError("給油量が入力されていません。")
-
-        # 数値（float）に変換
-        liters = float(liters_str)
-
-        if liters <= 0:
-            # マイナスや0はNG
-            raise ValueError("給油量は0より大きい数値を入力してください。")
-
-        # ★ ここで gogo.gs から最新の単価を取得
-        unit_price = get_unit_price()
-
-        # 金額を計算（小数点は四捨五入して整数円に）
-        total_price = int(round(liters * unit_price))
-
-        # 結果を画面に表示（index.html を再利用）
-        return render_template(
-            "index.html",
-            unit_price=unit_price,
-            total_price=total_price,
-            liters=liters,
-            error_message=None,
-        )
-
-    except ValueError as e:
-        # 入力ミスなどのわかりやすいエラー
-        try:
-            unit_price = get_unit_price()
-        except Exception:
-            unit_price = None
-        return render_template(
-            "index.html",
-            unit_price=unit_price,
-            total_price=None,
-            liters=None,
-            error_message=str(e),
-        )
-
-    except Exception as e:
-        # 通信エラー・スクレイピング失敗など
-        try:
-            unit_price = get_unit_price()
-        except Exception:
-            unit_price = None
-        return render_template(
-            "index.html",
-            unit_price=unit_price,
-            total_price=None,
-            liters=None,
-            error_message=f"予期しないエラーが発生しました：{e}",
-        )
-
-
-@app.route("/api/price", methods=["GET"])
-def api_price():
-    """
-    現在の単価を返すAPI（JSON）。
-
-    フロント側のJavaScriptから使いたい場合用です。
-    例：fetch('/api/price') で単価を取得。
-    """
-    try:
-        unit_price = get_unit_price()
-        return jsonify({"unit_price": unit_price})
-    except Exception as e:
-        return jsonify({"error": f"単価取得に失敗しました: {e}"}), 500
-
-
-@app.route("/api/calculate", methods=["POST"])
-def api_calculate():
-    """
-    JSONで給油量を受け取って金額を返すAPI。
-
-    リクエスト例：
-        POST /api/calculate
-        Content-Type: application/json
-        { "liters": 35 }
-
-    レスポンス例：
-        {
-          "liters": 35.0,
-          "unit_price": 172.5,
-          "total_price": 6038
-        }
-    """
-    data = request.get_json(silent=True) or {}
-    liters = data.get("liters")
-
-    # 入力チェック
-    try:
-        liters = float(liters)
-        if liters <= 0:
-            raise ValueError
-    except Exception:
-        return jsonify({"error": "liters は 0 より大きい数値を指定してください。"}), 400
-
-    try:
-        unit_price = get_unit_price()
-    except Exception as e:
-        return jsonify({"error": f"単価取得に失敗しました: {e}"}), 500
-
-    total_price = int(round(liters * unit_price))
-
-    return jsonify(
-        {
-            "liters": liters,
-            "unit_price": unit_price,
-            "total_price": total_price,
-        }
+        title="燃料計算表",
+        prices=prices,
+        fuel_key=fuel_key,
+        fuel_label=fuel_label,
+        unit_price=unit_price,
+        liters=liters,
+        total=total,
+        formatted_total=formatted_total,
+        error=error
     )
 
 
 if __name__ == "__main__":
-    """
-    アプリを起動する部分。
-
-    ・ローカルPCで起動するとき：
-        python server.py
-      → http://127.0.0.1:5050/ にアクセス
-
-    ・将来Renderなどのクラウドに置くとき：
-        そのサービス側が PORT という環境変数を渡してくるので、
-        os.environ.get("PORT", 5050) で拾って使う。
-    """
-    # 環境変数 PORT が設定されていればそれを使い、なければ 5050 番を使う
-    port = int(os.environ.get("PORT", 5050))
-
-    # host="0.0.0.0" にすることで、同じネットワーク内のスマホなどからもアクセス可能
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
